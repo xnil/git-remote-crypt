@@ -1,0 +1,490 @@
+#!/bin/bash
+
+# The MIT License (MIT)
+
+# Copyright (c) 2018 git-remote-crypt author (bpskdc@gmail.com)
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+# of the Software, and to permit persons to whom the Software is furnished to do
+# so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+set -e
+set -o pipefail
+if [ "$GIT_CRYPT_DEBUG" == "1" ]; then
+	PS4='L-${LINENO}: '
+	set -x
+fi
+
+# environment variables
+GIT_CRYPT_KEY=${GIT_CRYPT_KEY:-}
+GIT_CRYPT_ENCRYPTOR=${GIT_CRYPT_ENCRYPTOR:-}
+GIT_CRYPT_DECRYPTOR=${GIT_CRYPT_DECRYPTOR:-}
+GIT_CRYPT_KEY_FILE=${GIT_CRYPT_KEY_FILE:-~/.git-crypt-key}
+
+# global variables
+declare -A _remote_refs=()
+declare -A _encrypted_commits=()
+declare -A _decrypted_commits=()
+_verbosity=1
+_crypt_dir="`dirname $GIT_DIR`/.git/crypt"
+_backend_url=$2
+_placeholder="ph" # placeholder for github's protected branch
+if test "$1" = "crypt::$_backend_url"; then
+	_alias=
+else
+	_alias="$1"
+fi
+
+_stderr() {
+	echo -e "$@" >&2
+}
+
+_stdout() {
+	echo "$@"
+}
+
+_trace() {
+	if test $_verbosity -gt 1; then
+		_stderr "$@"
+	fi
+}
+
+_die () {
+	_stderr "fail: $@"
+	exit 1
+}
+
+_default_encryptor() {
+	openssl enc -aes-256-cbc -pass pass:$GIT_CRYPT_KEY
+}
+
+_default_decryptor() {
+	openssl enc -aes-256-cbc -d -pass pass:$GIT_CRYPT_KEY
+}
+
+_crypt_git() {
+	GIT_DIR=$_crypt_dir git "$@"
+}
+
+# _get_crypt_last_commit => stdout:commit
+_get_crypt_last_commit() {
+	_crypt_git log --all --topo-order -n 1 --pretty='%H' 2> /dev/null
+}
+
+# _exists_encrypted_object <rev> <path> => $?
+_exists_encrypted_object() {
+	_crypt_git cat-file -t "$1:$2" &> /dev/null
+}
+
+# _get_encrypted_objects <tree-ish> => stdout:array[encrypted_object_hash-object_type-object_hash])
+_get_encrypted_objects() {
+	_crypt_git ls-tree "$1" | awk '{print $3"-"$4}'
+}
+
+# _get_encrypted_object_count <tree-ish> => stdout:count
+_get_encrypted_object_count() {
+	_crypt_git ls-tree "$1" | wc -l
+}
+
+# _get_crypt_refs => stdout:array[crypt_commit ref-commit)
+_get_crypt_refs() {
+	_crypt_git for-each-ref --format='%(objectname) %(refname)' "refs/"
+}
+
+# _get_remote_refs => stdout:array[crypt_commit ref-commit])
+_get_remote_refs() {
+	_crypt_git ls-remote --refs "$_backend_url" 2> /dev/null
+}
+
+# _read_crypt_tree <tree-ish>
+_read_crypt_tree() {
+	_crypt_git read-tree "$1" &> /dev/null
+}
+
+# _update_crypt_index <object> <file>
+_update_crypt_index() {
+	_crypt_git update-index --add --cacheinfo 100644 "$1" "$2" &> /dev/null
+}
+
+# _write_crypt_tree
+_write_crypt_tree() {
+	_crypt_git write-tree
+}
+
+# _commit_crypt_tree <tree> <message> <parent>
+_commit_crypt_tree() {
+	if test -z "$3"; then
+		echo "$2" | _crypt_git commit-tree "$1"
+	else
+		echo "$2" | _crypt_git commit-tree "$1" -p "$3"
+	fi
+}
+
+# _update_crypt_ref <ref> <commit>
+_update_crypt_ref() {
+	_crypt_git update-ref "$1" "$2" &> /dev/null
+	_trace "update-ref $1 $2"
+	_crypt_git push "$_backend_url" "$1"
+}
+
+# _delete_crypt_ref <ref>
+_delete_crypt_ref() {
+	_crypt_git update-ref -d "$1" &> /dev/null
+	_trace "delete-ref $1"
+	_crypt_git push "$_backend_url" ":$1"
+}
+
+# _get_local_last_commit <rev> => stdout:commit
+_get_local_last_commit() {
+	git log "$1" --topo-order -n 1 --pretty='%H' 2> /dev/null
+}
+
+# _exists_local_object <object> => $?
+_exists_local_object() {
+	git cat-file -t "$1" &> /dev/null
+}
+
+# _get_local_object_type <object> => stdout:object_type
+_get_local_object_type() {
+	git cat-file -t "$1"
+}
+
+# _get_local_commits => stdout:array[commit])
+_get_local_commits() {
+	git for-each-ref --format='%(objectname)' 'refs/'
+}
+
+# _list_local_objects <commit> => stdout:array[object_hash path])
+_list_local_objects() {
+	local exclude_commits
+	for exclude_commit in ${!_encrypted_commits[@]}
+	do
+		exclude_commits="$exclude_commits ^$exclude_commit"
+	done
+	git rev-list --objects "$1" $exclude_commits
+}
+
+# _get_local_objects <commit> => stdout:array[object_hash])
+_get_local_objects() {
+	_list_local_objects "$1" | awk '{print $1}'
+}
+
+# _get_local_object_count <commit> => stdout:count
+_get_local_object_count() {
+	_list_local_objects "$1" | wc -l
+}
+
+# _is_ancestor <ancestor> <commit>
+_is_ancestor() {
+	git merge-base --is-ancestor "$1" "$2" &> /dev/null
+}
+
+# _update_local_ref <ref> <commit>
+_update_local_ref() {
+	git update-ref "$1" "$2" 1> /dev/null
+}
+
+# _encrypt_object <object_type> <object_hash> => stdout:encrypted_object_hash
+_encrypt_object() {
+	git cat-file "$1" "$2" | $GIT_CRYPT_ENCRYPTOR | _crypt_git hash-object -w --stdin -t blob
+}
+
+# _decrypt_object <encrypted_object_hash> <object_type> => stdout:object_hash
+_decrypt_object() {
+	_crypt_git cat-file -p "$1" | $GIT_CRYPT_DECRYPTOR | git hash-object -w --stdin -t "$2"
+}
+
+# _encrypt <src> <dst>
+_encrypt() {
+	local src="$1"
+	local dst="$2"
+	local force=false
+	local index_updated=false
+
+	if test ${src:0:1} == "+"; then
+		src=${src#*+}
+		force=true
+	fi
+
+	local local_last_commit=`_get_local_last_commit "$src"`
+
+	# get last commit from remote refs. if the value is empty, that means dst ref does not exist 
+	local remote_last_commit=${_remote_refs["$dst"]}
+	if test -n "$remote_last_commit" && test $force = false; then
+		# while remote_last_commit is not an ancestor of local_last_commit, panic
+		if ! _is_ancestor "$remote_last_commit" "$local_last_commit"; then
+			_die "Non-fast forward"
+		fi
+	fi
+
+	_stderr "Encrypt objects to crypt repository..."
+	local index=1 count=`_get_local_object_count "$src"`
+	while read object_hash
+	do
+		local object_type=`_get_local_object_type "$object_hash"`
+		local object="$object_type-$object_hash"
+		if _exists_encrypted_object $remote_last_commit $object; then
+			_stderr "present ($object)"
+		else
+			if test $index_updated == false && test -n "$remote_last_commit"; then
+				_read_crypt_tree "$dst-$remote_last_commit"
+			fi
+			local encrypted_object_hash=`_encrypt_object $object_type $object_hash`
+			_stderr "encrypt ($index/$count) ($object) => (blob:$encrypted_object_hash)"
+			_update_crypt_index $encrypted_object_hash $object
+			index_updated=true
+		fi
+		let index=$index+1
+	done < <(_get_local_objects "$src")
+	_stderr "done."
+
+	local crypt_last_commit=`_get_crypt_last_commit`
+	if test $index_updated == true; then
+		_trace "parent: $crypt_last_commit"
+		local tree=`_write_crypt_tree`
+		_trace "tree: $tree"
+		crypt_last_commit=`_commit_crypt_tree "$tree" "$local_last_commit" "$crypt_last_commit"`
+	fi
+
+	# delete old ref and update new ref
+	for ref_name in ${!_remote_refs[@]}
+	do
+		if test "$ref_name" == "$dst" && test "$dst-${_remote_refs[$dst]}" != "$dst-$local_last_commit"; then
+			_delete_crypt_ref "$dst-${_remote_refs[$dst]}"
+			unset _remote_refs[$dst]
+		fi
+	done
+	_update_crypt_ref "$dst-$_placeholder" "$crypt_last_commit"
+	_update_crypt_ref "$dst-$local_last_commit" "$crypt_last_commit"
+
+	# mark
+	_encrypted_commits["$local_last_commit"]="$crypt_last_commit"
+	
+	# fast forward local ref
+	if test -n "$_alias"; then
+		_update_local_ref "refs/remotes/$_alias/${dst##*/}" "$local_last_commit"
+	fi
+}
+
+# _decrypt <commit> <ref>
+_decrypt() {
+	local commit="$1" ref="$2"
+
+	# do nothing when commit is already decrypted
+	if test -n "${_decrypted_commits[$commit]}"; then
+		return
+	fi
+
+	_stderr "Decrypt objects to local repository..."
+	local index=1 count=`_get_encrypted_object_count "$ref-$commit"`
+	local object encrypted_object_hash object_type object_hash
+	while read object
+	do
+		IFS="-" read encrypted_object_hash object_type object_hash <<< $object
+		if _exists_local_object $object_hash; then
+			_stderr "present ($index/$count) ($object_type-$object_hash)"
+		else
+			_=`_decrypt_object "$encrypted_object_hash" "$object_type" 2> /dev/null` \
+				|| _die "Bad decrypt,maybe the key was not correct."
+			_stderr "decrypt ($index/$count) (blob:$encrypted_object_hash) => ($object_type-$object_hash)"
+		fi
+		let index=$index+1
+	done < <(_get_encrypted_objects "$ref-$commit")
+	_stderr "done."
+
+	# if the ref does not exist, create it
+	local local_last_commit=`_get_local_last_commit $ref`
+	if test -z "$local_last_commit"; then
+		_update_local_ref "$ref" "$commit"
+	fi
+
+	# mark
+	_decrypted_commits["$commit"]="$commit"
+}
+
+capabilities() {
+	_stdout option
+	_stdout fetch
+	_stdout push
+	_stdout
+}
+
+list() {
+	_stderr "Ensure crypt repository..."
+	if test ! -d "$_crypt_dir"; then
+		_crypt_git clone --bare "$_backend_url" "$_crypt_dir"
+	else
+		_crypt_git fetch $_backend_url *:* 1>&2 || true
+	fi
+
+	# config identify
+	local for_push
+	read _ for_push <<< $@
+	if test -n "$for_push"; then
+		local user_name=`git config --get user.name`
+		local user_email=`git config --get user.email`
+		if test -z "$user_name" || test -z "$user_email"; then
+			user_name="root"
+			user_email="root@localhost"
+		fi
+		_crypt_git config user.name $user_name &> /dev/null
+		_crypt_git config user.email $user_email &> /dev/null
+	fi
+
+	# collect remote refs and response to git program
+	local line item ref commit
+	while read line
+	do
+		read _ item <<< $line
+		local ref=${item%-*}
+		local commit=${item##*-}
+		test "$commit" == "$_placeholder" && continue
+		_trace ls-remote: $commit $ref
+		_stdout $commit $ref
+		_remote_refs["$ref"]="$commit"
+	done < <(_get_remote_refs)
+
+	_stdout
+}
+
+fetch() {
+	# collect decrypted commits
+	local commit
+	while read commit
+	do
+		_decrypted_commits["$commit"]="$commit"
+	done < <(_get_local_commits)
+
+	# read through all fetch commands
+	local line=$@ commit ref
+	while test -n "$line"
+	do
+		_trace "$line"
+		read _ commit ref <<< "$line"
+		_decrypt "$commit" "$ref"
+		read line
+	done
+
+	_stdout
+}
+
+# _delete <ref>
+_delete() {
+	for ref in ${!_remote_refs[@]}
+	do
+		if test "$ref" == "$1"; then
+			_delete_crypt_ref "$ref-$_placeholder"
+			_delete_crypt_ref "$ref-${_remote_refs[$ref]}"
+			unset _remote_refs[$ref]
+		fi
+	done
+}
+
+push() {
+	# collect encrypted commits
+	local line item ref crypt_commit original_commit
+	while read line
+	do
+		read crypt_commit item <<< "$line"
+		ref=${item%-*}
+		original_commit=${item##*-}
+		test "$original_commit" == "$_placeholder" && continue
+		if _exists_local_object "$original_commit"; then
+			_encrypted_commits["$original_commit"]="$crypt_commit"
+			_trace "encrypted: $original_commit $ref ($crypt_commit)"
+		fi
+	done < <(_get_crypt_refs)
+
+	# read through all push commands
+	local line=$@ refspec src dst
+	while test -n "$line"
+	do
+		_trace "$line"
+		read _ refspec <<< "$line"
+		IFS=":" read src dst <<< "$refspec"
+		if test -z "$src"; then
+			_delete "$dst"
+		else
+			_encrypt "$src" "$dst"
+		fi
+		read line
+	done
+
+	_stdout
+}
+
+option() {
+	read _ opt val <<< "$@"
+	case $opt in
+	verbosity)
+		_verbosity=$val
+		_stdout "ok"
+		;;
+	*)
+		_stdout "unsupported"
+		;;
+	esac
+}
+
+main() {
+	if test -n "$GIT_CRYPT_ENCRYPTOR" || test -n "$GIT_CRYPT_DECRYPTOR"; then
+		test -z "$GIT_CRYPT_DECRYPTOR" \
+			&& _die "The encryptor is specified but the decryptor is not specified."
+		test -z "$GIT_CRYPT_ENCRYPTOR" \
+			&& _die "The decryptor is specified but the encryptor is not specified."
+		if ! _stdout "_crypt_git" |
+			$GIT_CRYPT_ENCRYPTOR 2> /dev/null |
+			$GIT_CRYPT_DECRYPTOR 2> /dev/null |
+			{	read content &&	test "$content" == "_crypt_git"; }; then
+			_die "The specified cryptors not exist or execute permission denied or mismatch."
+		fi
+	elif test -z "$GIT_CRYPT_KEY"; then
+		if test ! -f "$GIT_CRYPT_KEY_FILE"; then
+			_die "No secret key specified. To specify your secret key, use:"
+			_die "    echo 'your secret key' > $GIT_CRYPT_KEY_FILE"
+		fi
+		GIT_CRYPT_KEY=`cat "$GIT_CRYPT_KEY_FILE"`
+	fi
+	GIT_CRYPT_ENCRYPTOR=${GIT_CRYPT_ENCRYPTOR:-_default_encryptor}
+	GIT_CRYPT_DECRYPTOR=${GIT_CRYPT_DECRYPTOR:-_default_decryptor}
+
+	while read line
+	do
+		case "$line" in
+		capabilities)
+			capabilities
+			;;
+		list|list\ for-push)
+			list "$line"
+			;;
+		fetch\ *)
+			fetch "$line"
+			;;
+		push\ *)
+			push "$line"
+			;;
+		option\ *)
+			option "$line"
+			;;
+		'')
+			exit
+			;;
+		esac
+	done
+}
+
+main

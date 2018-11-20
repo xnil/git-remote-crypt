@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# The MIT License (MIT)
+
+# Copyright (c) 2018 git-remote-crypt author (bpskdc@gmail.com)
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+# of the Software, and to permit persons to whom the Software is furnished to do
+# so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+_shunit2=/tmp/shunit2
+if [ ! -f $_shunit2/shunit2 ]; then
+  mkdir -p $_shunit2 &&
+  cd $_shunit2 &&
+  git clone https://github.com/kward/shunit2.git .
+  git checkout -b v2.1.7 && cd -
+fi
+
+# global variables
+_wd=`pwd`
+_git_crypt_wd=/tmp/git-crypt-test
+_git_crypt_scheme="crypt::"
+_git_crypt_remote=$_git_crypt_wd/remote
+_password=123456
+
+# environment variables
+GIT_CRYPT_TEST=${GIT_CRYPT_TEST:-}
+GIT_CRYPT_TEST_VERB=${GIT_CRYPT_TEST_VERB:-}
+
+_call() {
+  if test -z $GIT_CRYPT_TEST_VERB; then
+    "$@" &> /dev/null
+  else
+    echo -en "\033[31m$@ \033[0m\n" >&2 &&
+      "$@" 2> >(while read line; do echo -e "\e[1;30m    $line\e[0m" >&2; done)
+  fi
+}
+
+# _url <bare_repo_name>
+_url() {
+  echo ${_git_crypt_scheme}file://$_git_crypt_remote/$1
+}
+
+# _commit_file <file_name>
+_commit_file() {
+	echo "$1">"$1"
+	_call git add "$1"
+  git config user.email "root@localhost"
+  git config user.name "root"
+	_call git commit -m "$1" > /dev/null
+}
+
+# _new_repo <repo_name>
+_new_repo() {
+  mkdir -p $_git_crypt_wd/$1
+  _call cd $_git_crypt_wd/$1
+  _call git init > /dev/null
+}
+
+# _new_bare_repo <bare_repo_name>
+_new_bare_repo() {
+  mkdir -p $_git_crypt_remote/$1
+  _call cd $_git_crypt_remote/$1
+  _call git init --bare > /dev/null
+}
+
+# _clone_repo <bare_repo_name> <dir>
+_clone_repo() {
+  mkdir -p $_git_crypt_wd/$2
+  _call cd $_git_crypt_wd/$2
+  GIT_CRYPT_KEY="$_password" _call git clone `_url $1` . -v
+  assertEquals $? 0
+}
+
+# _new_simple_repo
+_new_simple_repo() {
+  _new_bare_repo simple
+  _clone_repo simple $FUNCNAME/a
+  cd $_git_crypt_wd/$FUNCNAME/a && _commit_file simple
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+}
+
+# _new_divergent_history_repos <$FUNCNAME>
+_new_divergent_history_repos() {
+  _new_simple_repo
+
+  _clone_repo simple $1/a
+  cd $_git_crypt_wd/$1/a && _commit_file a
+
+  _clone_repo simple $1/b
+  cd $_git_crypt_wd/$1/b && _commit_file b
+}
+
+suite() {
+  if test -z $GIT_CRYPT_TEST; then
+    suite_addTest test_remote_add_and_push
+    suite_addTest test_two_branch_ref_same
+    suite_addTest test_push_all_branch
+    suite_addTest test_delete_branch
+    suite_addTest test_non_fast_forward_error
+    suite_addTest test_non_fast_forward_rebase_and_push
+    suite_addTest test_non_fast_forward_force_push
+    suite_addTest test_multi_remote
+    suite_addTest test_separator
+    suite_addTest test_cryptor
+  else
+    suite_addTest $GIT_CRYPT_TEST
+  fi
+}
+
+test_remote_add_and_push() {
+  _new_bare_repo simple
+
+  _new_repo ${FUNCNAME}_a
+  cd $_git_crypt_wd/${FUNCNAME}_a
+  _call git remote add origin `_url simple`
+  _commit_file 1
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+
+  _new_repo ${FUNCNAME}_b
+  cd $_git_crypt_wd/${FUNCNAME}_b
+  _call git remote add origin `_url simple`
+  GIT_CRYPT_KEY="$_password" _call git pull origin master -v
+  assertEquals $? 0
+  _commit_file 2
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+
+  _new_repo ${FUNCNAME}_verify
+  cd $_git_crypt_wd/${FUNCNAME}_verify
+  _call git remote add origin `_url simple`
+  GIT_CRYPT_KEY="$_password" _call git pull origin master -v
+  assertEquals $? 0
+  test -f $_git_crypt_wd/${FUNCNAME}_verify/1
+  assertEquals $? 0
+  test -f $_git_crypt_wd/${FUNCNAME}_verify/2
+  assertEquals $? 0
+}
+
+test_two_branch_ref_same() {
+  _new_simple_repo
+  _clone_repo simple $FUNCNAME/a
+
+  cd $_git_crypt_remote/simple
+  old_object_count=`git rev-list --all --objects | wc -l`
+
+  cd $_git_crypt_wd/$FUNCNAME/a
+  _call git branch same_as_master
+  GIT_CRYPT_KEY="$_password" _call git push origin same_as_master
+  assertEquals $? 0
+
+  cd $_git_crypt_remote/simple
+  new_object_count=`git rev-list --all --objects | wc -l`
+  
+  assertEquals "$old_object_count" "$new_object_count"
+
+  cd $_git_crypt_remote/simple
+  assertEquals `git branch -l | wc -l` 4
+}
+
+test_push_all_branch() {
+  _new_bare_repo simple
+  _new_repo $FUNCNAME/a
+  _call cd $_git_crypt_wd/$FUNCNAME/a
+  _commit_file 1
+  _call git checkout -b dev
+  _commit_file 2
+  _call git remote add origin `_url simple`
+  GIT_CRYPT_KEY="$_password" _call git push origin *:* -v
+  assertEquals $? 0
+}
+
+test_delete_branch() {
+  _new_simple_repo
+
+  cd $_git_crypt_remote/simple
+  only_master=`git branch -l | wc -l`
+  assertEquals $only_master 2
+
+  _clone_repo simple $FUNCNAME/a
+  _call cd $_git_crypt_wd/$FUNCNAME/a
+  _call git branch dev
+  GIT_CRYPT_KEY="$_password" _call git push origin dev -v
+  assertEquals $? 0
+
+  cd $_git_crypt_remote/simple
+  master_and_dev=`git branch -l | wc -l`
+  assertEquals $master_and_dev 4
+
+  _call cd $_git_crypt_wd/$FUNCNAME/a
+  GIT_CRYPT_KEY="$_password" _call git push origin :dev -v
+  assertEquals $? 0
+
+  cd $_git_crypt_remote/simple
+  only_master=`git branch -l | wc -l`
+  assertEquals $only_master 2
+}
+
+test_non_fast_forward_error() {
+  _new_divergent_history_repos $FUNCNAME
+
+  _call cd $_git_crypt_wd/$FUNCNAME/a
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+
+  _call cd $_git_crypt_wd/$FUNCNAME/b
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertNotEquals $? 0
+}
+
+test_non_fast_forward_rebase_and_push() {
+  _new_divergent_history_repos $FUNCNAME
+
+  repo_a=$_git_crypt_wd/$FUNCNAME/a
+  repo_b=$_git_crypt_wd/$FUNCNAME/b
+
+  cd $repo_a
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+
+  cd $repo_b
+  test ! -f $repo_b/a
+  assertEquals $? 0
+  GIT_CRYPT_KEY="$_password" _call git pull origin master --rebase -v
+  assertEquals $? 0
+  test -f $repo_b/a
+  assertEquals $? 0
+
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+}
+
+test_non_fast_forward_force_push() {
+  _new_divergent_history_repos $FUNCNAME
+
+  _call cd $_git_crypt_wd/$FUNCNAME/a
+  GIT_CRYPT_KEY="$_password" _call git push origin master -v
+  assertEquals $? 0
+
+  _call cd $_git_crypt_wd/$FUNCNAME/b
+  GIT_CRYPT_KEY="$_password" _call git push origin master -f
+  assertEquals $? 0
+}
+
+test_multi_remote() {
+  _new_bare_repo a
+  _new_bare_repo b
+ 
+  _new_repo $FUNCNAME/c
+
+  _call cd $_git_crypt_wd/$FUNCNAME/c
+  _commit_file 1
+  _call git remote add a `_url a`
+  GIT_CRYPT_KEY="$_password" _call git push a master -v
+  assertEquals $? 0
+  _call git remote add b `_url b`
+  GIT_CRYPT_KEY="$_password" _call git push b master -v
+  assertEquals $? 0
+
+  _clone_repo a $FUNCNAME/d
+  _clone_repo b $FUNCNAME/e
+  test -f $_git_crypt_wd/$FUNCNAME/d/1
+  assertEquals $? 0
+  test -f $_git_crypt_wd/$FUNCNAME/e/1
+  assertEquals $? 0
+
+  _call cd $_git_crypt_wd/$FUNCNAME/c
+  _commit_file 2
+  GIT_CRYPT_KEY="$_password" _call git push a master -v
+  assertEquals $? 0
+  GIT_CRYPT_KEY="$_password" _call git push b master -v
+  assertEquals $? 0
+
+  _call cd $_git_crypt_wd/$FUNCNAME/d
+  GIT_CRYPT_KEY="$_password" _call git pull origin master -v
+  assertEquals $? 0
+  test -f $_git_crypt_wd/$FUNCNAME/d/2
+  assertEquals $? 0
+  _call cd $_git_crypt_wd/$FUNCNAME/e
+  GIT_CRYPT_KEY="$_password" _call git pull origin master -v
+  assertEquals $? 0
+  test -f $_git_crypt_wd/$FUNCNAME/e/2
+  assertEquals $? 0
+}
+
+test_separator() {
+  _new_simple_repo
+
+  _clone_repo simple $FUNCNAME/a
+  cd $_git_crypt_wd/$FUNCNAME/a
+  _call git checkout -b separator-separator
+  GIT_CRYPT_KEY="$_password" _call git push origin *:* -v
+  assertEquals $? 0
+
+  _clone_repo simple $FUNCNAME/b
+}
+
+test_cryptor() {
+  _new_simple_repo
+  local url=`_url simple`
+  mkdir -p $_git_crypt_wd/$FUNCNAME && cd $_git_crypt_wd/$FUNCNAME
+
+  local encryptor=$_git_crypt_wd/$FUNCNAME/encryptor
+  local decryptor=$_git_crypt_wd/$FUNCNAME/decryptor
+
+  # no key specified
+  GIT_CRYPT_KEY='' GIT_CRYPT_KEY_FILE='' _call git clone "$url" 
+  assertNotEquals $? 0
+
+  # key file not exist
+  GIT_CRYPT_KEY='' GIT_CRYPT_KEY_FILE='NOT-EXIST' _call git clone "$url" 
+  assertNotEquals $? 0
+
+  # only specify encryptor
+  GIT_CRYPT_ENCRYPTOR=$_git_crypt_wd/$FUNCNAME/_encryptor _call git clone "$url"
+  assertNotEquals $? 0
+
+  # only specify decryptor
+  GIT_CRYPT_DECRYPTOR=$_git_crypt_wd/$FUNCNAME/_decryptor _call git clone "$url"
+  assertNotEquals $? 0
+
+  # cryptors not exit
+  GIT_CRYPT_ENCRYPTOR=NOT-EXIST GIT_CRYPT_DECRYPTOR=NOT-EXIST _call git clone "$url"
+  assertNotEquals $? 0
+
+  # permission denied
+  echo "openssl enc -aes-256-cbc -pass pass:abcdef" > "$encryptor"
+  echo "openssl enc -aes-256-cbc -d -pass pass:abcdef" > "$decryptor"
+  chmod -x "$encryptor"
+  chmod -x "$decryptor"
+  GIT_CRYPT_ENCRYPTOR=$encryptor GIT_CRYPT_DECRYPTOR=$decryptor _call git clone "$url"
+  assertNotEquals $? 0
+
+  # cryptors mismatch
+  echo "openssl enc -aes-256-cbc -pass pass:abcdef" > "$encryptor"
+  echo "openssl enc -aes-256-cbc -d -pass pass:123456" > "$decryptor"
+  chmod +x "$encryptor"
+  chmod +x "$decryptor"
+  GIT_CRYPT_ENCRYPTOR=$encryptor GIT_CRYPT_DECRYPTOR=$decryptor _call git clone "$url"
+  assertNotEquals $? 0
+
+  # wrong key
+  GIT_CRYPT_KEY="1" _call git clone "$url"
+  assertNotEquals $? 0
+
+  # right key
+  GIT_CRYPT_KEY="$_password" _call git clone "$url" a
+  assertEquals $? 0
+
+  # right key file
+  local key=$_git_crypt_wd/$FUNCNAME/key
+  echo "$_password" > $key
+  GIT_CRYPT_KEY="" GIT_CRYPT_KEY_FILE=$key _call git clone "$url" b
+  assertEquals $? 0
+}
+
+setUp() {
+  cd $_wd && mkdir -p $_git_crypt_wd
+}
+
+tearDown() {
+  cd $_wd && rm -rf $_git_crypt_wd
+}
+
+. $_shunit2/shunit2
